@@ -22,7 +22,7 @@ from sklearn.metrics import (
 )
 
 
-def generate_binary_prediction_csv(file_path, data_size = 1000):
+def generate_binary_prediction_csv(file_path, data_size = 1000, y_true = None, attribute = None):
     """
     Generate synthetic data to unit test eval scripts and stores in user
     provided path
@@ -32,15 +32,17 @@ def generate_binary_prediction_csv(file_path, data_size = 1000):
     data_size (int): number of rows of data to be generated
     """
     # Generate random data for y_true, y_pred, and attribute_gender
-    y_true = np.random.randint(2, size=data_size)
     y_pred = np.random.randint(2, size=data_size)
-    attribute_gender = np.random.randint(2, size=data_size) # assume binary attribute
-    
+
+    if (y_true is None) and (attribute is None):
+      y_true = np.random.randint(2, size=data_size)
+      attribute = np.random.randint(2, size=data_size) # assume binary attribute
+      
     # Create a DataFrame using pandas
     df = pd.DataFrame({
         'y_true': y_true,
         'y_pred': y_pred,
-        'attribute_gender': attribute_gender
+        'attribute_gender': attribute
     })
     
     # Ensure all parent directories of the given path are made
@@ -48,6 +50,18 @@ def generate_binary_prediction_csv(file_path, data_size = 1000):
 
     # Write the DataFrame to a CSV file
     df.to_csv(file_path, index=False)
+
+
+def batch_generate_binary_prediction_csv(folder_path, num_files = 100, data_size = 1000):
+  
+  os.makedirs(os.path.dirname(folder_path), exist_ok=True)
+
+  y_true = np.random.randint(2, size=data_size)
+  attribute = np.random.randint(2, size=data_size)
+  
+  for i in range(num_files):
+    csv_path = os.path.join(folder_path, f'sample_data{i}.csv')
+    generate_binary_prediction_csv(csv_path, data_size, y_true, attribute)
 
 # Quick utility function to get confusion matrix
 def _get_conf_mat_values(y_true, y_pred):
@@ -109,7 +123,7 @@ def evaluate_file(path_obj):
 
     return results
 
-def batch_evaluate(folder_path, write_name = None):
+def batch_evaluate(folder_path, attr_list, write_name = None):
   """
   Processes model result CSV files in the 
 
@@ -129,9 +143,98 @@ def batch_evaluate(folder_path, write_name = None):
   for path in list(folder.glob('*.csv')):
     perf_data[str(path)] = evaluate_file(path)
   
+  model_mult = evaluate_model_multiplicity(folder_path, attr_list)
+
+  results = {
+     "model_performance": perf_data,
+     "model_multiplicity": model_mult
+  }
+  
   # Write data to 'write_name' json file 
   if write_name is not None:
     with open(str(folder/write_name), "w") as outfile:
-      json.dump(perf_data, outfile, indent=4)
+      json.dump(results, outfile, indent=4)
   
-  return perf_data
+  return results
+
+def load_data_folder(folder_path):
+    folder = pathlib.Path(folder_path)
+    data_files = list(folder.glob('*.csv'))
+
+    dframes = [pd.read_csv(path_obj) for path_obj in data_files]
+
+    return dframes
+
+
+def compute_ambiguity(dframes, group = None, attribute_name = None):
+    """
+    Parameters:
+    dframes: list of dataframes
+    """
+
+    data = []
+
+    # If group is specified, then limit view to protected group
+    if group is not None:
+        for df in dframes:
+            data.append(df[df[attribute_name]==group])
+    else:
+        data = dframes
+    
+    all_preds = np.array([df['y_pred'].to_numpy() for df in data])
+
+    # num_models, num_preds = all_preds.shape --> should hold
+    # compute number of unique values for each column
+    unique_counts = np.array([len(np.unique(all_preds[:, i])) for i in range(all_preds.shape[1])])
+
+    return (unique_counts > 1).mean()
+
+
+def compute_discrepancy(dframes, group = None, attribute_name = None):
+    data = []
+
+    # If group is specified, then limit view to protected group
+    if group is not None:
+        for df in dframes:
+            data.append(df[df[attribute_name]==group])
+    else:
+        data = dframes
+    
+    all_preds = np.array([df['y_pred'].to_numpy() for df in data])
+    num_models, num_preds = all_preds.shape
+
+    max_disc = 0
+
+    # Pass through all model pairings to compute discrepancy
+    for i in range(num_models):
+        for j in range(i,num_models):
+            disagree = (all_preds[i] != all_preds[j]).sum()
+
+            # Change return if needed
+            max_disc = max(max_disc, disagree)
+    
+    return max_disc/num_preds
+
+def evaluate_model_multiplicity(folder_path, attr_list):
+    dframes = load_data_folder(folder_path)
+
+    results = {}
+
+    # compute total amgig, disc metrics
+    results["aggregate"] = {
+        "ambiguity": compute_ambiguity(dframes),
+        "discrepancy": compute_discrepancy(dframes)
+    }
+
+    # compute group level metrics for each attr
+    results["attribute"] = {}
+
+    for attr in attr_list:
+        results["attribute"][attr] = {}
+        for group in [0,1]:
+            results["attribute"][attr][group] = {
+                "ambiguity": compute_ambiguity(dframes, group, attr),
+                "discrepancy": compute_discrepancy(dframes, group, attr)
+            }
+
+    return results
