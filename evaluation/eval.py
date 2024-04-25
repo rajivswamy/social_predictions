@@ -76,17 +76,56 @@ def _get_conf_mat_values(y_true, y_pred):
   return TN, FP, FN, TP
 
 def predictive_parity(y_true, y_pred):
-  TN, FP, FN, TP = _get_conf_mat_values(y_true, y_pred)
-  return TP/(TP+FP)
+    TN, FP, FN, TP = _get_conf_mat_values(y_true, y_pred)
+
+    if TP + FP == 0:
+        return 0
+
+    return TP/(TP+FP)
 
 def error_rate_ratio(y_true, y_pred):
-  TN, FP, FN, TP = _get_conf_mat_values(y_true, y_pred)
-  return FN/FP
+    TN, FP, FN, TP = _get_conf_mat_values(y_true, y_pred)
+
+    if FP == 0:
+        return 0
+    
+    return FN/FP
+
+def evaluate_model(y_true, y_pred, sensitive_attribute):
+    
+    # Fairness measurements processing
+    metrics = {
+              'selection_rate': selection_rate,
+              'ppv': predictive_parity,
+              'fp_err_rate_balance': false_positive_rate,
+              'tp_error_rate_balance': true_positive_rate,
+              'accuracy': accuracy_score,
+              'error_rate_ratio': error_rate_ratio,
+               }
+
+    mf = MetricFrame(
+                    metrics=metrics,
+                    y_true=y_true,
+                    y_pred=y_pred,
+                    sensitive_features=sensitive_attribute
+                    )
+    
+    results = {
+        'model_performance': {'accuracy': accuracy_score(y_true, y_pred),
+                              'f1_score': f1_score(y_true, y_pred, zero_division=0.0),
+                              'precision': precision_score(y_true, y_pred, zero_division=0.0),
+                              'recall': recall_score(y_true, y_pred),
+                              },
+        'fairness_performance': {
+                                'by_group_data': mf.by_group.to_dict(), # raw data
+                                'difference': mf.difference().to_dict(), # max inter-group diff per stat
+                                },
+    }
+
+    return results
 
 def evaluate_file(path_obj):
     df = pd.read_csv(path_obj)
-
-    model_name = path_obj.name
 
     y_true = df['y_true']
     y_pred = df['y_pred']
@@ -121,6 +160,44 @@ def evaluate_file(path_obj):
             },
     }
 
+    return results
+
+
+def batch_evaluate_v2(predictions_path, targets_path, sensitive_attributes_path, write_path = None):
+   
+    predictions_df = pd.read_csv(predictions_path)
+    targets_df = pd.read_csv(targets_path)
+    # sensitive_df = pd.read_csv(sensitive_attributes_path)
+
+    random_array = np.random.randint(2, size=targets_df.shape[0])
+    sensitive_attribute = pd.Series(random_array, name='sensitive_attribute')
+
+    pred_cols = [col for col in predictions_df if col.startswith('model_')]
+    predictions_df = predictions_df[pred_cols]
+
+    per_model_data = {}  
+    # use args to get list of prediction vectors, target vector, and sens attr vector
+    # Iterate through all the predictions for each model in the rashomon set
+    for col in predictions_df:
+       y_true = targets_df['Target']
+       y_pred = predictions_df[col]
+
+       per_model_data[col] = evaluate_model(y_true, y_pred, sensitive_attribute)
+
+    # Now compute the multiplicity metrics
+
+    mult_data = evaluate_model_multiplicity_v2(predictions_df, sensitive_attribute, groups = [0,1])
+
+    results = {
+       "per_model_data": per_model_data,
+     "model_multiplicity": mult_data
+    }
+
+    # Write data to 'write_name' json file 
+    if write_path is not None:
+        with open(write_path, "w") as outfile:
+            json.dump(results, outfile, indent=4)
+    
     return results
 
 def batch_evaluate(folder_path, attr_list, write_name = None):
@@ -189,6 +266,49 @@ def compute_ambiguity(dframes, group = None, attribute_name = None):
 
     return (unique_counts > 1).mean()
 
+def compute_ambiguity_v2(preds_df, sensetive_attribute, group = None):
+    """
+    Parameters:
+    dframes: list of dataframes
+    """
+
+    data = preds_df.copy()
+
+    # If group is specified, then limit view to protected group
+    if group is not None:
+        data = preds_df[sensetive_attribute == group]
+
+    all_preds = data.to_numpy().T
+
+    # num_models, num_preds = all_preds.shape --> should hold
+    # compute number of unique values for each column
+    unique_counts = np.array([len(np.unique(all_preds[:, i])) for i in range(all_preds.shape[1])])
+
+    return (unique_counts > 1).mean()
+
+
+def compute_discrepancy_v2(preds_df, sensetive_attribute, group = None):
+    data = preds_df.copy()
+
+    # If group is specified, then limit view to protected group
+    if group is not None:
+        data = preds_df[sensetive_attribute == group]
+
+    all_preds = data.to_numpy().T
+
+    num_models, num_preds = all_preds.shape
+
+    max_disc = 0
+
+    # Pass through all model pairings to compute discrepancy
+    for i in range(num_models):
+        for j in range(i,num_models):
+            disagree = (all_preds[i] != all_preds[j]).sum()
+
+            # Change return if needed
+            max_disc = max(max_disc, disagree)
+    
+    return max_disc/num_preds
 
 def compute_discrepancy(dframes, group = None, attribute_name = None):
     data = []
@@ -235,6 +355,27 @@ def evaluate_model_multiplicity(folder_path, attr_list):
             results["attribute"][attr][group] = {
                 "ambiguity": compute_ambiguity(dframes, group, attr),
                 "discrepancy": compute_discrepancy(dframes, group, attr)
+            }
+
+    return results
+
+def evaluate_model_multiplicity_v2(preds_df, sensetive_attribute, groups = None):
+
+    results = {}
+
+    # compute total amgig, disc metrics
+    results["aggregate"] = {
+        "ambiguity": compute_ambiguity_v2(preds_df, sensetive_attribute),
+        "discrepancy": compute_discrepancy_v2(preds_df, sensetive_attribute)
+    }
+
+    # compute group level metrics for each attr
+    results["by_group"] = {}
+
+    for group in groups:
+        results["by_group"][group] = {
+            "ambiguity": compute_ambiguity_v2(preds_df, sensetive_attribute, group),
+            "discrepancy": compute_discrepancy_v2(preds_df, sensetive_attribute, group)
             }
 
     return results
