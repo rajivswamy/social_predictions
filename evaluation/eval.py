@@ -163,18 +163,48 @@ def evaluate_file(path_obj):
     return results
 
 
-def batch_evaluate_v2(predictions_path, targets_path, sensitive_attributes_path, write_path = None):
+def get_cp_preds_df(folder_path):
+    def transform_bool_to_int(bool_series):
+        return bool_series.astype(int)
+    dfs = []
+    # Iterate over files in the directory
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith('.csv') and file_name.startswith('random_cp_draw_'):
+            # Extract the model number from the file name
+            model_number = file_name.split('_')[-1].split('.')[0]
+            
+            # Read the CSV file
+            df = pd.read_csv(os.path.join(folder_path, file_name))
+            
+            # Transform True/False values to 1s and 0s
+            df['y_pred'] = transform_bool_to_int(df['y_pred'])
+            
+            # Rename the 'y_pred' column to 'model_[x]'
+            df.rename(columns={'y_pred': f'model_{model_number}'}, inplace=True)
+            
+            # Append the modified dataframe to the list
+            dfs.append(df[f'model_{model_number}'])
+
+    result_df = pd.concat(dfs, axis=1)
+
+    return result_df
+
+
+def batch_evaluate_v2(predictions_path, targets_path, features_path, cp=False, write_path = None):
    
-    predictions_df = pd.read_csv(predictions_path)
+    if cp: 
+        predictions_df = get_cp_preds_df(predictions_path)
+    else:
+        predictions_df = pd.read_csv(predictions_path)
+        pred_cols = [col for col in predictions_df if col.startswith('model_')]
+        predictions_df = predictions_df[pred_cols]
+
+    
     targets_df = pd.read_csv(targets_path)
-    # sensitive_df = pd.read_csv(sensitive_attributes_path)
-
-    random_array = np.random.randint(2, size=targets_df.shape[0])
-    sensitive_attribute = pd.Series(random_array, name='sensitive_attribute')
-
-    pred_cols = [col for col in predictions_df if col.startswith('model_')]
-    predictions_df = predictions_df[pred_cols]
-
+    features_df = pd.read_csv(features_path)
+    # random_array = np.random.randint(2, size=targets_df.shape[0])
+    sensitive_attribute = features_df['one_hot__Gender_1 <= 0.50']
+    
     per_model_data = {}  
     # use args to get list of prediction vectors, target vector, and sens attr vector
     # Iterate through all the predictions for each model in the rashomon set
